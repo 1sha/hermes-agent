@@ -542,10 +542,67 @@ Write only the summary body. Do not include any preamble or prefix."""
     # Main compression entry point
     # ------------------------------------------------------------------
 
+    def _archive_before_compaction(self, messages: List[Dict[str, Any]]) -> None:
+        """Archive full conversation context to text file before compaction destroys it."""
+        try:
+            import os
+            from datetime import datetime, timezone
+            archives_dir = os.path.expanduser("~/.hermes/archives")
+            # Determine agent name from HERMES_HOME env
+            hermes_home = os.environ.get("HERMES_HOME", "")
+            if "/profiles/" in hermes_home:
+                agent_name = hermes_home.rstrip("/").split("/")[-1]
+            else:
+                agent_name = "_default"
+            agent_dir = os.path.join(archives_dir, agent_name)
+            os.makedirs(agent_dir, exist_ok=True)
+            now = datetime.now(timezone.utc)
+            timestamp = now.strftime("%Y%m%d_%H%M%S")
+            filepath = os.path.join(agent_dir, f"{timestamp}_pre-compaction.txt")
+            lines = []
+            lines.append("=" * 80)
+            lines.append(f"PRE-COMPACTION ARCHIVE — {agent_name}")
+            lines.append(f"Timestamp: {now.isoformat()}")
+            lines.append(f"Messages: {len(messages)}")
+            lines.append(f"Compaction #{self.compression_count + 1}")
+            lines.append("=" * 80)
+            lines.append("")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                lines.append(f"--- [{i+1}] {role.upper()} ---")
+                if content:
+                    if isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                lines.append(part.get("text", ""))
+                            elif isinstance(part, dict):
+                                lines.append(f"[{part.get('type', 'unknown')} content]")
+                            else:
+                                lines.append(str(part))
+                    else:
+                        lines.append(str(content)[:50000])
+                for tc in msg.get("tool_calls", []):
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "?")
+                        args = fn.get("arguments", "")
+                        lines.append(f"  [TOOL CALL] {name}")
+                        lines.append(f"  {args[:5000]}")
+                lines.append("")
+            lines.append(f"{'=' * 80}")
+            lines.append(f"END — {len(messages)} messages archived before compaction")
+            with open(filepath, "w") as f:
+                f.write("\n".join(lines))
+            logger.info("Pre-compaction archive: %s (%d messages)", filepath, len(messages))
+        except Exception as e:
+            logger.warning("Pre-compaction archive failed (non-fatal): %s", e)
+
     def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
+          0. Archive full context to text file (lossless backup)
           1. Prune old tool results (cheap pre-pass, no LLM call)
           2. Protect head messages (system prompt + first exchange)
           3. Find tail boundary by token budget (~20K tokens of recent context)
@@ -564,6 +621,9 @@ Write only the summary body. Do not include any preamble or prefix."""
                     self.protect_first_n + self.protect_last_n + 1,
                 )
             return messages
+
+        # Phase 0: Archive full context before destroying it
+        self._archive_before_compaction(messages)
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 

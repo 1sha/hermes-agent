@@ -87,6 +87,7 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.context_compressor import ContextCompressor
+from agent.tiered_context_compressor import TieredContextCompressor, stamp_message as _stamp_msg
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
@@ -1154,6 +1155,12 @@ class AIAgent:
         compression_summary_model = _compression_cfg.get("summary_model") or None
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        # Strategy: "position" (default, legacy) or "tiered" (time-based)
+        compression_strategy = str(_compression_cfg.get("strategy", "position")).lower()
+        # Tiered compression sub-config
+        _tiered_cfg = _compression_cfg.get("tiered", {})
+        if not isinstance(_tiered_cfg, dict):
+            _tiered_cfg = {}
 
         # Read explicit context_length override from model config
         _model_cfg = _agent_cfg.get("model", {})
@@ -1188,7 +1195,7 @@ class AIAgent:
                                         pass
                         break
         
-        self.context_compressor = ContextCompressor(
+        _compressor_common_kwargs = dict(
             model=self.model,
             threshold_percent=compression_threshold,
             protect_first_n=3,
@@ -1201,6 +1208,20 @@ class AIAgent:
             config_context_length=_config_context_length,
             provider=self.provider,
         )
+        if compression_strategy == "tiered":
+            _tiered_tiers = _tiered_cfg.get("tiers")  # list of dicts or None
+            _tiered_ancient = float(_tiered_cfg.get("ancient_ratio", 0.10))
+            _tiered_min_ts = float(_tiered_cfg.get("min_timestamped_fraction", 0.5))
+            self.context_compressor = TieredContextCompressor(
+                **_compressor_common_kwargs,
+                tiers=_tiered_tiers,
+                ancient_ratio=_tiered_ancient,
+                min_timestamped_fraction=_tiered_min_ts,
+            )
+            if not self.quiet_mode:
+                logger.info("Using TIERED context compressor (time-based)")
+        else:
+            self.context_compressor = ContextCompressor(**_compressor_common_kwargs)
         self.compression_enabled = compression_enabled
         self._user_turn_count = 0
 
@@ -4329,6 +4350,133 @@ class AIAgent:
             raise result["error"]
         return result["response"]
 
+    # ── Claude Max token rotation ───────────────────────────────────────────
+
+    def _tick_claude_max_usage(self):
+        """Record a successful API call in Claude Max rotation usage tracking.
+
+        Calls `rotation.py tick` to increment the per-account request counter.
+        Silent — failures are logged but never interrupt the agent loop.
+        """
+        rotation_v2 = Path.home() / ".hermes" / "claude-max-rotation" / "rotation_v2.py"
+        rotation_v1 = Path.home() / ".hermes" / "claude-max-rotation" / "rotation.py"
+        rotation_script = rotation_v2 if rotation_v2.exists() else rotation_v1
+        if not rotation_script.exists():
+            return
+
+        # Only tick for anthropic provider (Claude Max)
+        provider = getattr(self, 'provider', None) or ''
+        if 'anthropic' not in str(provider).lower():
+            return
+
+        try:
+            import subprocess
+            subprocess.run(
+                [sys.executable, str(rotation_script), "tick"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            pass  # Silent — usage tracking must never disrupt the agent loop
+
+    def _try_claude_max_rotation(self, reset_time: str = None, retry_after: str = None) -> bool:
+        """Attempt to rotate Claude Max OAuth token on rate limit.
+
+        Calls rotation_v2.py mark-rate-limit which:
+        1. Records the 429 event with strike counting (2x 429 in 300s → cooldown)
+        2. On threshold: parks account, switches to next priority account
+        3. Syncs all governed Paperclip agents + all .env targets
+
+        Args:
+            reset_time: ISO 8601 reset timestamp from anthropic-ratelimit-*-reset header.
+            retry_after: retry-after header value (integer seconds or HTTP-date).
+
+        Returns True if rotation succeeded, False otherwise.
+        """
+        # Prefer V2 rotation system; fall back to V1
+        rotation_v2 = Path.home() / ".hermes" / "claude-max-rotation" / "rotation_v2.py"
+        rotation_v1 = Path.home() / ".hermes" / "claude-max-rotation" / "rotation.py"
+        rotation_script = rotation_v2 if rotation_v2.exists() else rotation_v1
+        if not rotation_script.exists():
+            return False
+
+        # Only rotate for anthropic provider (Claude Max)
+        provider = getattr(self, 'provider', None) or ''
+        if 'anthropic' not in str(provider).lower():
+            return False
+
+        try:
+            import subprocess
+
+            # Determine which account is active by reading state
+            active_account = "unknown"
+            state_v2 = Path.home() / ".hermes" / "claude-max-rotation" / "state_v2.json"
+            state_v1 = Path.home() / ".hermes" / "claude-max-rotation" / "state.json"
+            state_file = state_v2 if state_v2.exists() else state_v1
+            try:
+                import json as _json
+                with open(state_file) as _f:
+                    _state = _json.load(_f)
+                    active_account = _state.get("active_account_id", "unknown")
+            except Exception:
+                pass
+
+            agent_name = getattr(self, 'agent_name', None) or getattr(self, 'profile_name', 'unknown')
+
+            if rotation_script == rotation_v2:
+                # V2: use mark-rate-limit with rich metadata
+                cmd = [
+                    sys.executable, str(rotation_script), "mark-rate-limit",
+                    "--account", str(active_account),
+                    "--agent", str(agent_name),
+                    "--source", "run_agent_429_hook",
+                ]
+                if retry_after:
+                    cmd.extend(["--retry-after", str(retry_after)])
+                if reset_time:
+                    cmd.extend(["--reset-at", str(reset_time)])
+            else:
+                # V1 fallback: use hit command
+                cmd = [sys.executable, str(rotation_script), "hit"]
+                if reset_time:
+                    cmd.append(reset_time)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=30,
+            )
+            output = result.stdout.strip()
+            if output:
+                self._vprint(f"{self.log_prefix}🔄 Token rotation: {output}", force=True)
+
+            if result.returncode == 0 and ("Switched to" in output or "rotation triggered" in output or "cooled" in output):
+                # Re-read the token from environment / .env
+                # The rotation script already updated the .env file;
+                # reload it into the current process environment.
+                env_path = Path.home() / ".hermes" / ".env"
+                if env_path.exists():
+                    for line in env_path.read_text().splitlines():
+                        line = line.strip()
+                        if line.startswith("CLAUDE_CODE_OAUTH_TOKEN=") and not line.startswith("#"):
+                            new_token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = new_token
+                            # Do NOT propagate to ANTHROPIC_API_KEY — that triggers
+                            # "api" billing mode which rejects OAuth tokens (sk-ant-oat...)
+
+                            # CRITICAL: Rebuild the OpenAI client with the new token.
+                            # Without this, the retry loop sends the OLD (rate-limited)
+                            # token and hits 429 again immediately.
+                            if hasattr(self, '_client_kwargs') and isinstance(self._client_kwargs, dict):
+                                self._client_kwargs["api_key"] = new_token
+                                self._replace_primary_openai_client(reason="claude_max_rotation")
+                                self._vprint(f"{self.log_prefix}🔑 Rotated token + rebuilt API client", force=True)
+                            else:
+                                self._vprint(f"{self.log_prefix}🔑 Loaded new token into environment (client rebuild skipped — no _client_kwargs)", force=True)
+                            return True
+            return False
+        except Exception as e:
+            logging.warning(f"Claude Max rotation failed: {e}")
+            return False
+
     # ── Provider fallback ──────────────────────────────────────────────────
 
     def _try_activate_fallback(self) -> bool:
@@ -4967,7 +5115,7 @@ class AIAgent:
                 tool_calls.append(tc_dict)
             msg["tool_calls"] = tool_calls
 
-        return msg
+        return _stamp_msg(msg)
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
@@ -5256,7 +5404,7 @@ class AIAgent:
                 store=self._todo_store,
             )
         elif function_name == "session_search":
-            if not self._session_db:
+            if not self._session_db and not function_args.get("profiles"):
                 return json.dumps({"success": False, "error": "Session database not available."})
             from tools.session_search_tool import session_search as _session_search
             return _session_search(
@@ -5265,6 +5413,7 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                profiles=function_args.get("profiles"),
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -5318,11 +5467,11 @@ class AIAgent:
         if self._interrupt_requested:
             print(f"{self.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
             for tc in tool_calls:
-                messages.append({
+                messages.append(_stamp_msg({
                     "role": "tool",
                     "content": f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
                     "tool_call_id": tc.id,
-                })
+                }))
             return
 
         # ── Parse args + pre-execution bookkeeping ───────────────────────
@@ -5469,11 +5618,11 @@ class AIAgent:
                 )
 
             # Append tool result message in order
-            tool_msg = {
+            tool_msg = _stamp_msg({
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tc.id,
-            }
+            })
             messages.append(tool_msg)
 
         # ── Budget pressure injection ────────────────────────────────────
@@ -5506,11 +5655,11 @@ class AIAgent:
                     self._vprint(f"{self.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
                 for skipped_tc in remaining_calls:
                     skipped_name = skipped_tc.function.name
-                    skip_msg = {
+                    skip_msg = _stamp_msg({
                         "role": "tool",
                         "content": f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
                         "tool_call_id": skipped_tc.id,
-                    }
+                    })
                     messages.append(skip_msg)
                 break
 
@@ -5583,7 +5732,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
-                if not self._session_db:
+                if not self._session_db and not function_args.get("profiles"):
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
                     from tools.session_search_tool import session_search as _session_search
@@ -5593,6 +5742,7 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        profiles=function_args.get("profiles"),
                     )
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
@@ -5723,11 +5873,11 @@ class AIAgent:
                     f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
                 )
 
-            tool_msg = {
+            tool_msg = _stamp_msg({
                 "role": "tool",
                 "content": function_result,
                 "tool_call_id": tool_call.id
-            }
+            })
             messages.append(tool_msg)
 
             if not self.quiet_mode:
@@ -6116,7 +6266,7 @@ class AIAgent:
                 logger.debug("Honcho prefetch failed (non-fatal): %s", e)
 
         # Add user message
-        user_msg = {"role": "user", "content": user_message}
+        user_msg = _stamp_msg({"role": "user", "content": user_message})
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         self._persist_user_message_idx = current_turn_user_idx
@@ -6287,6 +6437,7 @@ class AIAgent:
                 break
             
             api_call_count += 1
+            self._tick_claude_max_usage()
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
@@ -7009,6 +7160,30 @@ class AIAgent:
                         or "usage limit" in error_msg
                         or "quota" in error_msg
                     )
+                    # Claude Max token rotation — on 429, rotate to next account
+                    if is_rate_limited:
+                        # Extract reset time and retry-after from error headers if available
+                        _reset_time = None
+                        _retry_after = None
+                        if hasattr(api_error, 'response') and hasattr(api_error.response, 'headers'):
+                            _headers = api_error.response.headers
+                            _reset_time = (
+                                _headers.get('anthropic-ratelimit-requests-reset')
+                                or _headers.get('anthropic-ratelimit-tokens-reset')
+                            )
+                            _retry_after = (
+                                _headers.get('retry-after')
+                                or _headers.get('Retry-After')
+                            )
+                        if self._try_claude_max_rotation(reset_time=_reset_time, retry_after=_retry_after):
+                            # Rotation succeeded — reset retries and immediately
+                            # re-attempt with the new token/client.
+                            # V2.1: Add random jitter (1-5s) before retry to prevent
+                            # thundering herd — without this, all 48 agents hit the
+                            # new account simultaneously after rotation.
+                            time.sleep(random.uniform(1, 5))
+                            retry_count = 0
+                            continue
                     if is_rate_limited and self._fallback_index < len(self._fallback_chain):
                         self._emit_status("⚠️ Rate limited — switching to fallback provider...")
                         if self._try_activate_fallback():

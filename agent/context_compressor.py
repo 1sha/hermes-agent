@@ -30,7 +30,9 @@ SUMMARY_PREFIX = (
     "already completed, and the current session state may still reflect "
     "that work (for example, files may already be changed). Use the summary "
     "and the current state to continue from where things left off, and "
-    "avoid repeating work:"
+    "avoid repeating work. ⚠️ IMPORTANT: Raw file contents are NOT preserved "
+    "in this summary — always re-read files (via read_file or cat) before "
+    "making modifications. The File Version Chain section below has full paths:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
@@ -290,8 +292,14 @@ Update the summary using this exact structure. PRESERVE all existing information
 ## Key Decisions
 [Important technical decisions and why they were made]
 
-## Relevant Files
-[Files read, modified, or created — with brief note on each. Accumulate across compactions.]
+## File Version Chain
+[CRITICAL — For every file that was read, modified, or created, preserve the FULL absolute path and version history. Accumulate across compactions — NEVER drop file entries from previous summaries. Format each file as:]
+- **path:** `/absolute/path/to/file` (current state: brief description)
+  - v3 (latest): what changed — git commit hash if available, or snapshot path
+  - v2: what changed — git commit hash or snapshot path
+  - v1 (original): initial state — git commit hash or snapshot path
+[Preserve ALL file entries from the previous summary. Add new files from the new turns. Update version chains for files that were modified again.]
+[⚠️ IMPORTANT: The next assistant MUST re-read any file before modifying it — the raw file contents are NOT preserved in this summary.]
 
 ## Next Steps
 [What needs to happen next to continue the work]
@@ -299,7 +307,7 @@ Update the summary using this exact structure. PRESERVE all existing information
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
-Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions.
+Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. ALWAYS preserve full absolute file paths and version history — this is the most important part of the summary for continuity.
 
 Write only the summary body. Do not include any preamble or prefix."""
         else:
@@ -328,8 +336,14 @@ Use this exact structure:
 ## Key Decisions
 [Important technical decisions and why they were made]
 
-## Relevant Files
-[Files read, modified, or created — with brief note on each]
+## File Version Chain
+[CRITICAL — For every file that was read, modified, or created, preserve the FULL absolute path and version history. Format each file as:]
+- **path:** `/absolute/path/to/file` (current state: brief description of what it contains now)
+  - v3 (latest): what changed — git commit hash if available, or snapshot path
+  - v2: what changed — git commit hash or snapshot path
+  - v1 (original): initial state — git commit hash or snapshot path
+[If git is being used, include the repo path and relevant commit hashes. If no git, note the file path only.]
+[⚠️ IMPORTANT: The next assistant MUST re-read any file before modifying it — the raw file contents are NOT preserved in this summary.]
 
 ## Next Steps
 [What needs to happen next to continue the work]
@@ -337,7 +351,7 @@ Use this exact structure:
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation]
 
-Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details.
+Target ~{summary_budget} tokens. Be specific — include file paths, command outputs, error messages, and concrete values rather than vague descriptions. The goal is to prevent the next assistant from repeating work or losing important details. ALWAYS preserve full absolute file paths and version history — this is the most important part of the summary for continuity.
 
 Write only the summary body. Do not include any preamble or prefix."""
 

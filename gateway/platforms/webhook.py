@@ -326,6 +326,34 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt_template, payload, event_type, route_name
         )
 
+        # ── Malformed payload detection ───────────────────────────
+        # If many template variables remain unresolved, the sender
+        # failed to include required keys.  Prepend a warning so the
+        # agent can triage instead of blindly executing a broken task.
+        unresolved = self._count_unresolved_vars(prompt)
+        if unresolved and len(unresolved) >= 3:
+            var_list = ", ".join(unresolved)
+            payload_keys = ", ".join(payload.keys()) if isinstance(payload, dict) else "(not a dict)"
+            prompt = (
+                f"⚠️ MALFORMED WEBHOOK: Received task with {len(unresolved)} "
+                f"uninterpolated template variables: {var_list}\n"
+                f"Sender payload keys: {payload_keys}\n"
+                f"This likely means the upstream dispatcher failed to populate "
+                f"the webhook payload correctly. Check the sender's dispatch code.\n"
+                f"Raw payload: {json.dumps(payload, indent=2)[:2000]}\n\n"
+                f"--- Original (partially rendered) prompt below ---\n\n"
+                f"{prompt}"
+            )
+            logger.warning(
+                "[webhook] Route '%s' delivery %s: MALFORMED — %d unresolved vars (%s). "
+                "Payload keys: %s",
+                route_name,
+                request.headers.get("X-Request-ID", "?"),
+                len(unresolved),
+                var_list,
+                payload_keys,
+            )
+
         # Inject skill content if configured.
         # We call build_skill_invocation_message() directly rather than
         # using /skill-name slash commands — the gateway's command parser
@@ -492,6 +520,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 f"'{route_name}':\n\n```json\n{truncated}\n```"
             )
 
+        unresolved: list = []
+
         def _resolve(match: re.Match) -> str:
             key = match.group(1)
             value: Any = payload
@@ -499,12 +529,33 @@ class WebhookAdapter(BasePlatformAdapter):
                 if isinstance(value, dict):
                     value = value.get(part, f"{{{key}}}")
                 else:
+                    unresolved.append(key)
                     return f"{{{key}}}"
             if isinstance(value, (dict, list)):
                 return json.dumps(value, indent=2)[:2000]
-            return str(value)
+            result = str(value)
+            # Detect if the value is itself an unresolved template variable
+            if result == f"{{{key}}}":
+                unresolved.append(key)
+            return result
 
-        return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _resolve, template)
+        rendered = re.sub(r"\{([a-zA-Z0-9_.]+)\}", _resolve, template)
+
+        if unresolved:
+            logger.warning(
+                "[webhook] Route '%s': %d unresolved template variable(s): %s. "
+                "Sender payload is missing required keys. Payload keys: %s",
+                route_name,
+                len(unresolved),
+                ", ".join(unresolved),
+                ", ".join(payload.keys()) if isinstance(payload, dict) else "(not a dict)",
+            )
+
+        return rendered
+
+    def _count_unresolved_vars(self, rendered: str) -> list:
+        """Return list of unresolved {variable} placeholders in rendered text."""
+        return re.findall(r"\{([a-zA-Z0-9_.]+)\}", rendered)
 
     def _render_delivery_extra(
         self, extra: dict, payload: dict

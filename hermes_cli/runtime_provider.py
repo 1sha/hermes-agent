@@ -9,6 +9,7 @@ from hermes_cli import auth as auth_mod
 from hermes_cli.auth import (
     AuthError,
     PROVIDER_REGISTRY,
+    DEFAULT_CODEX_BASE_URL,
     format_auth_error,
     resolve_provider,
     resolve_nous_runtime_credentials,
@@ -377,11 +378,21 @@ def resolve_runtime_provider(
         # Allow base URL override from config.yaml model.base_url, but only
         # when the configured provider is anthropic — otherwise a non-Anthropic
         # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
+        #
+        # Important regression: load_config() deep-merges DEFAULT_CONFIG into the
+        # active profile. If a profile switches provider from openai-codex to
+        # anthropic without explicitly setting model.base_url, the inherited
+        # Codex default URL (DEFAULT_CODEX_BASE_URL) remains present in the
+        # merged model config. That made Anthropic sessions send Claude models to
+        # chatgpt.com/backend-api/codex, yielding empty response.output / HTML
+        # challenge pages instead of valid Anthropic responses.
         model_cfg = _get_model_config()
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = ""
         if cfg_provider == "anthropic":
-            cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+            raw_cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            if raw_cfg_base_url and raw_cfg_base_url != DEFAULT_CODEX_BASE_URL:
+                cfg_base_url = raw_cfg_base_url
         base_url = cfg_base_url or "https://api.anthropic.com"
         return {
             "provider": "anthropic",

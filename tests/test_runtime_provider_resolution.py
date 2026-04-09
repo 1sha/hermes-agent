@@ -103,6 +103,29 @@ def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     assert resolved["base_url"] == "https://custom.example/v1"
 
 
+def test_resolve_runtime_provider_anthropic_ignores_inherited_codex_base_url(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "anthropic",
+            "base_url": rp.DEFAULT_CODEX_BASE_URL,
+        },
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.resolve_anthropic_token",
+        lambda: "anthropic-test-token",
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["base_url"] == "https://api.anthropic.com"
+    assert resolved["api_key"] == "anthropic-test-token"
+
+
 def test_openrouter_key_takes_priority_over_openai_key(monkeypatch):
     """OPENROUTER_API_KEY should be used over OPENAI_API_KEY when both are set.
 

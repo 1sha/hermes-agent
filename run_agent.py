@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 import os
 import random
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -3589,6 +3590,8 @@ class AIAgent:
         self._reasoning_deltas_fired = False
         for attempt in range(max_stream_retries + 1):
             try:
+                streamed_output_items: List[Any] = []
+                streamed_text_parts: List[str] = []
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
                         if self._interrupt_requested:
@@ -3598,6 +3601,7 @@ class AIAgent:
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
                             if delta_text and not has_tool_calls:
+                                streamed_text_parts.append(delta_text)
                                 if not first_delta_fired:
                                     first_delta_fired = True
                                     if on_first_delta:
@@ -3609,12 +3613,23 @@ class AIAgent:
                         # Track tool calls to suppress text streaming
                         elif "function_call" in event_type:
                             has_tool_calls = True
+                        elif event_type == "response.output_item.done":
+                            event_item = getattr(event, "item", None)
+                            if event_item is not None:
+                                streamed_output_items.append(event_item)
+                                if getattr(event_item, "type", None) in {"function_call", "custom_tool_call"}:
+                                    has_tool_calls = True
                         # Fire reasoning callbacks
                         elif "reasoning" in event_type and "delta" in event_type:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                    return stream.get_final_response()
+                    final_response = stream.get_final_response()
+                    return self._hydrate_codex_stream_response(
+                        final_response,
+                        streamed_output_items,
+                        "".join(streamed_text_parts).strip(),
+                    )
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -3649,11 +3664,25 @@ class AIAgent:
             return stream_or_response
 
         terminal_response = None
+        streamed_output_items: List[Any] = []
+        streamed_text_parts: List[str] = []
         try:
             for event in stream_or_response:
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
+                if event_type == "response.output_item.done":
+                    event_item = getattr(event, "item", None)
+                    if event_item is None and isinstance(event, dict):
+                        event_item = event.get("item")
+                    if event_item is not None:
+                        streamed_output_items.append(event_item)
+                elif event_type == "response.output_text.delta":
+                    delta_text = getattr(event, "delta", None)
+                    if delta_text is None and isinstance(event, dict):
+                        delta_text = event.get("delta")
+                    if isinstance(delta_text, str) and delta_text:
+                        streamed_text_parts.append(delta_text)
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
 
@@ -3661,7 +3690,11 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
-                    return terminal_response
+                    return self._hydrate_codex_stream_response(
+                        terminal_response,
+                        streamed_output_items,
+                        "".join(streamed_text_parts).strip(),
+                    )
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -3671,8 +3704,90 @@ class AIAgent:
                     pass
 
         if terminal_response is not None:
-            return terminal_response
+            return self._hydrate_codex_stream_response(
+                terminal_response,
+                streamed_output_items,
+                "".join(streamed_text_parts).strip(),
+            )
         raise RuntimeError("Responses create(stream=True) fallback did not emit a terminal response.")
+
+    def _hydrate_codex_stream_response(
+        self,
+        response: Any,
+        streamed_output_items: Optional[List[Any]] = None,
+        streamed_text: str = "",
+    ) -> Any:
+        """Patch Codex streamed responses whose final ParsedResponse omits output items."""
+        output_items = list(streamed_output_items or [])
+        current_output = getattr(response, "output", None) if response is not None else None
+        if isinstance(current_output, list) and current_output:
+            return response
+
+        synthesized_text = streamed_text.strip() if isinstance(streamed_text, str) else ""
+        if not output_items and synthesized_text:
+            output_items = [
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    phase="final_answer",
+                    content=[SimpleNamespace(type="output_text", text=synthesized_text)],
+                )
+            ]
+
+        if not output_items:
+            return response
+
+        if not synthesized_text:
+            chunks: List[str] = []
+            for item in output_items:
+                if getattr(item, "type", None) != "message":
+                    continue
+                chunks.append(self._extract_responses_message_text(item))
+            synthesized_text = "\n".join(chunk for chunk in chunks if chunk).strip()
+
+        field_names = (
+            "id",
+            "created_at",
+            "error",
+            "incomplete_details",
+            "instructions",
+            "metadata",
+            "model",
+            "object",
+            "parallel_tool_calls",
+            "temperature",
+            "tool_choice",
+            "tools",
+            "top_p",
+            "background",
+            "completed_at",
+            "conversation",
+            "max_output_tokens",
+            "max_tool_calls",
+            "previous_response_id",
+            "prompt",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "reasoning",
+            "safety_identifier",
+            "service_tier",
+            "status",
+            "text",
+            "usage",
+            "output_text",
+        )
+        payload: Dict[str, Any] = {}
+        if response is not None:
+            for name in field_names:
+                if hasattr(response, name):
+                    payload[name] = getattr(response, name)
+        payload["output"] = output_items
+        if synthesized_text:
+            payload["output_text"] = synthesized_text
+        if not payload.get("status"):
+            payload["status"] = "completed"
+        return SimpleNamespace(**payload)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider != "openai-codex":
@@ -4371,24 +4486,38 @@ class AIAgent:
 
         try:
             import subprocess
+            account_id = (os.environ.get("CLAUDE_MAX_ACCOUNT_ID") or "").strip()
+            cmd = [sys.executable, str(rotation_script), "tick"]
+            if account_id:
+                cmd.extend(["--account", account_id])
             subprocess.run(
-                [sys.executable, str(rotation_script), "tick"],
+                cmd,
                 capture_output=True, text=True, timeout=5,
             )
         except Exception:
             pass  # Silent — usage tracking must never disrupt the agent loop
 
-    def _try_claude_max_rotation(self, reset_time: str = None, retry_after: str = None) -> bool:
-        """Attempt to rotate Claude Max OAuth token on rate limit.
+    def _try_claude_max_rotation(
+        self,
+        reset_time: str = None,
+        retry_after: str = None,
+        status_code: Optional[int] = None,
+        error_type: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Attempt to rotate Claude Max OAuth token on provider limit failures.
 
         Calls rotation_v2.py mark-rate-limit which:
-        1. Records the 429 event with strike counting (2x 429 in 300s → cooldown)
+        1. Records the limit event with strike counting / telemetry classification
         2. On threshold: parks account, switches to next priority account
         3. Syncs all governed Paperclip agents + all .env targets
 
         Args:
             reset_time: ISO 8601 reset timestamp from anthropic-ratelimit-*-reset header.
             retry_after: retry-after header value (integer seconds or HTTP-date).
+            status_code: Provider HTTP status code for telemetry classification.
+            error_type: Provider error type/classification string when available.
+            error_message: Provider-facing error message for quota-style detection.
 
         Returns True if rotation succeeded, False otherwise.
         """
@@ -4399,28 +4528,35 @@ class AIAgent:
         if not rotation_script.exists():
             return False
 
-        # Only rotate for anthropic provider (Claude Max)
-        provider = getattr(self, 'provider', None) or ''
-        if 'anthropic' not in str(provider).lower():
-            return False
+        # Prefer the explicit Claude Max markers over provider name alone.
+        # Some local/proxy setups route Claude Max OAuth through a non-anthropic
+        # provider label while still using the same rotation control plane.
+        provider = getattr(self, 'provider', None)
+        if provider and 'anthropic' not in str(provider).lower():
+            has_rotation_markers = bool(
+                (os.environ.get("CLAUDE_MAX_ACCOUNT_ID") or "").strip()
+                or (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+            )
+            if not has_rotation_markers:
+                return False
 
         try:
-            import subprocess
-
-            # Determine which account is active by reading state
-            active_account = "unknown"
-            state_v2 = Path.home() / ".hermes" / "claude-max-rotation" / "state_v2.json"
-            state_v1 = Path.home() / ".hermes" / "claude-max-rotation" / "state.json"
-            state_file = state_v2 if state_v2.exists() else state_v1
-            try:
-                import json as _json
-                with open(state_file) as _f:
-                    _state = _json.load(_f)
-                    active_account = _state.get("active_account_id", "unknown")
-            except Exception:
-                pass
+            active_account = (os.environ.get("CLAUDE_MAX_ACCOUNT_ID") or "").strip() or "unknown"
+            if active_account == "unknown":
+                state_v2 = Path.home() / ".hermes" / "claude-max-rotation" / "state_v2.json"
+                state_v1 = Path.home() / ".hermes" / "claude-max-rotation" / "state.json"
+                state_file = state_v2 if state_v2.exists() else state_v1
+                try:
+                    import json as _json
+                    with open(state_file) as _f:
+                        _state = _json.load(_f)
+                        active_account = _state.get("active_account_id", "unknown")
+                except Exception:
+                    pass
 
             agent_name = getattr(self, 'agent_name', None) or getattr(self, 'profile_name', 'unknown')
+            if not getattr(self, 'agent_name', None):
+                self.agent_name = agent_name
 
             if rotation_script == rotation_v2:
                 # V2: use mark-rate-limit with rich metadata
@@ -4434,6 +4570,12 @@ class AIAgent:
                     cmd.extend(["--retry-after", str(retry_after)])
                 if reset_time:
                     cmd.extend(["--reset-at", str(reset_time)])
+                if status_code is not None:
+                    cmd.extend(["--status-code", str(status_code)])
+                if error_type:
+                    cmd.extend(["--error-type", str(error_type)])
+                if error_message:
+                    cmd.extend(["--message", str(error_message)])
             else:
                 # V1 fallback: use hit command
                 cmd = [sys.executable, str(rotation_script), "hit"]
@@ -4452,26 +4594,44 @@ class AIAgent:
                 # Re-read the token from environment / .env
                 # The rotation script already updated the .env file;
                 # reload it into the current process environment.
-                env_path = Path.home() / ".hermes" / ".env"
+                env_path = rotation_script.parent.parent / ".env"
+                if not env_path.exists():
+                    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+                    env_path = (
+                        Path(hermes_home) / ".env"
+                        if hermes_home
+                        else Path.home() / ".hermes" / ".env"
+                    )
                 if env_path.exists():
+                    new_token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
                     for line in env_path.read_text().splitlines():
                         line = line.strip()
                         if line.startswith("CLAUDE_CODE_OAUTH_TOKEN=") and not line.startswith("#"):
                             new_token = line.split("=", 1)[1].strip().strip('"').strip("'")
                             os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = new_token
-                            # Do NOT propagate to ANTHROPIC_API_KEY — that triggers
-                            # "api" billing mode which rejects OAuth tokens (sk-ant-oat...)
+                        elif line.startswith("CLAUDE_MAX_ACCOUNT_ID=") and not line.startswith("#"):
+                            os.environ["CLAUDE_MAX_ACCOUNT_ID"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if new_token:
+                        # Do NOT propagate to ANTHROPIC_API_KEY — that triggers
+                        # "api" billing mode which rejects OAuth tokens (sk-ant-oat...)
 
-                            # CRITICAL: Rebuild the OpenAI client with the new token.
-                            # Without this, the retry loop sends the OLD (rate-limited)
-                            # token and hits 429 again immediately.
-                            if hasattr(self, '_client_kwargs') and isinstance(self._client_kwargs, dict):
-                                self._client_kwargs["api_key"] = new_token
+                        # CRITICAL: Rebuild the OpenAI client with the new token.
+                        # Without this, the retry loop sends the OLD (rate-limited)
+                        # token and hits 429 again immediately.
+                        if hasattr(self, '_client_kwargs') and isinstance(self._client_kwargs, dict):
+                            self._client_kwargs["api_key"] = new_token
+                            try:
                                 self._replace_primary_openai_client(reason="claude_max_rotation")
                                 self._vprint(f"{self.log_prefix}🔑 Rotated token + rebuilt API client", force=True)
-                            else:
-                                self._vprint(f"{self.log_prefix}🔑 Loaded new token into environment (client rebuild skipped — no _client_kwargs)", force=True)
-                            return True
+                            except Exception as client_exc:
+                                logging.warning(f"Claude Max client rebuild failed after rotation: {client_exc}")
+                                self._vprint(
+                                    f"{self.log_prefix}🔑 Loaded rotated token into environment (client rebuild failed; retry will use refreshed kwargs)",
+                                    force=True,
+                                )
+                        else:
+                            self._vprint(f"{self.log_prefix}🔑 Loaded new token into environment (client rebuild skipped — no _client_kwargs)", force=True)
+                        return True
             return False
         except Exception as e:
             logging.warning(f"Claude Max rotation failed: {e}")
@@ -7159,12 +7319,18 @@ class AIAgent:
                         or "rate_limit" in error_msg
                         or "usage limit" in error_msg
                         or "quota" in error_msg
+                        or "out of extra usage" in error_msg
                     )
                     # Claude Max token rotation — on 429, rotate to next account
                     if is_rate_limited:
-                        # Extract reset time and retry-after from error headers if available
+                        # Extract reset time and retry-after from error headers if available.
+                        # Also forward provider classification metadata so rotation
+                        # telemetry can distinguish 400/quota-style exhaustion from
+                        # ordinary 429 backoff events.
                         _reset_time = None
                         _retry_after = None
+                        _rotation_error_type = None
+                        _rotation_error_message = None
                         if hasattr(api_error, 'response') and hasattr(api_error.response, 'headers'):
                             _headers = api_error.response.headers
                             _reset_time = (
@@ -7175,7 +7341,23 @@ class AIAgent:
                                 _headers.get('retry-after')
                                 or _headers.get('Retry-After')
                             )
-                        if self._try_claude_max_rotation(reset_time=_reset_time, retry_after=_retry_after):
+                        _err_body = getattr(api_error, "body", None)
+                        if isinstance(_err_body, dict):
+                            _err_obj = _err_body.get("error")
+                            if isinstance(_err_obj, dict):
+                                _rotation_error_type = _err_obj.get("type") or _err_obj.get("code")
+                                _rotation_error_message = _err_obj.get("message")
+                            if not _rotation_error_message:
+                                _rotation_error_message = _err_body.get("message")
+                        if not _rotation_error_message:
+                            _rotation_error_message = self._clean_error_message(str(api_error))
+                        if self._try_claude_max_rotation(
+                            reset_time=_reset_time,
+                            retry_after=_retry_after,
+                            status_code=status_code,
+                            error_type=_rotation_error_type or error_type,
+                            error_message=_rotation_error_message,
+                        ):
                             # Rotation succeeded — reset retries and immediately
                             # re-attempt with the new token/client.
                             # V2.1: Add random jitter (1-5s) before retry to prevent

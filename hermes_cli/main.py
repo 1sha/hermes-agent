@@ -2,6 +2,39 @@
 """
 Hermes CLI - Main entry point.
 
+# ==========================================================================
+# !!!  PAPERCLIP GATEWAY-FORWARD SHIM — WEUP-2626 / WEU-2527  !!!
+# ==========================================================================
+#
+#   This file contains a CRITICAL SHIM in the cmd_chat() function
+#   (search for "_try_gateway_forward") that intercepts Paperclip's
+#   hermes_local dispatch and forwards tasks to persistent gateways
+#   instead of running throwaway one-shot sessions.
+#
+#   HOW IT WORKS:
+#     1. Paperclip fires:  hermes chat -q "task..." --profile <name>
+#     2. _apply_profile_override() sets HERMES_HOME for that profile
+#     3. cmd_chat() calls _try_gateway_forward(query)
+#     4. If a gateway is running (PID check) → POST to its webhook
+#        endpoint at localhost:{WEBHOOK_PORT}/webhooks/task-inbox
+#     5. If no gateway → falls through to normal one-shot behavior
+#
+#   WHY:
+#     Paperclip's hermes_local adapter spawns ephemeral hermes chat
+#     sessions that have no memory and burn tokens re-reading context.
+#     With 52 agents, that's 52 throwaway processes per dispatch cycle.
+#     The shim routes to persistent gateways with full context instead.
+#
+#   DEPENDS ON:
+#     - Per-profile .env files with WEBHOOK_PORT and WEBHOOK_SECRET
+#     - Per-profile webhook_subscriptions.json with "task-inbox" route
+#     - Running gateway processes (hermes gateway run --replace)
+#     - gateway.status.is_gateway_running() for PID detection
+#
+#   ADDED: 2026-04-13 by Shaheen / Claude — WEUP-2626
+#   SEE ALSO: hermes/agent-infrastructure/fleet-config/profiles/
+# ==========================================================================
+
 Usage:
     hermes                     # Interactive chat (default)
     hermes chat                # Interactive chat
@@ -501,8 +534,264 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     return None
 
 
+# ==========================================================================
+# ==========================================================================
+#
+#   GATEWAY-FORWARD SHIM  (WEUP-2626 / WEU-2527)
+#
+#   This is the Paperclip → persistent gateway bridge.  When Paperclip
+#   dispatches via hermes_local, this function intercepts the one-shot
+#   "hermes chat -q ..." call and forwards the task to a running gateway
+#   process instead.  See the file-level docstring for full explanation.
+#
+#   If you are debugging task dispatch, START HERE.
+#
+# ==========================================================================
+# ==========================================================================
+
+_GATEWAY_FORWARD_PROFILE_CACHE = {}
+
+
+def _resolve_gateway_forward_hermes_home():
+    """Resolve the profile-specific HERMES_HOME for Paperclip-spawned runs.
+
+    Paperclip's hermes_local adapter does not currently pass --profile or
+    HERMES_HOME to ``hermes chat``. It *does* pass PAPERCLIP_AGENT_ID, so we
+    use that to recover the canonical Hermes profile before deciding whether we
+    can forward into a persistent gateway.
+    """
+    import json as _json
+    import urllib.request
+    from pathlib import Path as _Path
+
+    existing_home = os.getenv("HERMES_HOME")
+    if existing_home:
+        return _Path(existing_home).expanduser()
+
+    default_home = (_Path.home() / ".hermes").expanduser()
+    agent_id = os.getenv("PAPERCLIP_AGENT_ID", "").strip()
+    if not agent_id:
+        return default_home
+
+    cached_home = _GATEWAY_FORWARD_PROFILE_CACHE.get(agent_id)
+    if cached_home:
+        return _Path(cached_home)
+
+    def _cache_profile(profile: str):
+        resolved_home = (default_home / "profiles" / profile).expanduser()
+        _GATEWAY_FORWARD_PROFILE_CACHE[agent_id] = str(resolved_home)
+        return resolved_home
+
+    registry_path = default_home / "paperclip-agents.json"
+    if registry_path.exists():
+        try:
+            agents = _json.loads(registry_path.read_text())
+            for agent in agents:
+                if agent.get("id") != agent_id:
+                    continue
+                profile = agent.get("profile") or (agent.get("adapterConfig") or {}).get("profile")
+                if profile:
+                    return _cache_profile(profile)
+        except Exception:
+            pass
+
+    api_base = os.getenv("PAPERCLIP_API_URL", "").strip().rstrip("/")
+    company_id = os.getenv("PAPERCLIP_COMPANY_ID", "").strip()
+    if api_base and company_id:
+        try:
+            req = urllib.request.Request(
+                f"{api_base}/companies/{company_id}/agents",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                agents = _json.loads(resp.read().decode("utf-8", errors="replace"))
+            for agent in agents:
+                if agent.get("id") != agent_id:
+                    continue
+                profile = agent.get("profile") or (agent.get("adapterConfig") or {}).get("profile")
+                if profile:
+                    return _cache_profile(profile)
+        except Exception:
+            pass
+
+    return default_home
+
+def _try_gateway_forward(query: str) -> bool:
+    """If a persistent gateway is running for this HERMES_HOME, forward the
+    query to it via webhook and return True.  Returns False if no gateway
+    is available, letting the caller fall through to the normal one-shot path.
+
+    This is the "hermes_local shim" — Paperclip fires ``hermes chat -q ...``
+    exactly as before, but instead of spinning up a throwaway session we
+    route the task into the already-running gateway process which has full
+    persistent context.
+    """
+    import hashlib
+    import hmac as _hmac
+    import json as _json
+    import urllib.request
+    import urllib.error
+    from pathlib import Path as _Path
+
+    previous_home = os.getenv("HERMES_HOME")
+    hermes_home = _resolve_gateway_forward_hermes_home()
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    if previous_home != str(hermes_home) and os.getenv("PAPERCLIP_AGENT_ID"):
+        print(f"[gateway-forward] Using HERMES_HOME={hermes_home}")
+
+    # --- 1. Is a gateway running? ------------------------------------------
+    try:
+        from gateway.status import is_gateway_running
+        if not is_gateway_running():
+            return False
+    except Exception:
+        return False
+
+    # --- 2. Read WEBHOOK_PORT from .env ------------------------------------
+    env_path = hermes_home / ".env"
+    webhook_port = None
+    webhook_secret = None
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key == "WEBHOOK_PORT":
+                webhook_port = int(val)
+            elif key == "WEBHOOK_SECRET":
+                webhook_secret = val
+
+    if not webhook_port:
+        # No webhook port configured — can't forward
+        return False
+
+    # Default secret matches fleet standard
+    if not webhook_secret:
+        webhook_secret = "shaheen-fleet-internal-2026"
+
+    # --- 3. Build flat payload matching task-inbox template -----------------
+    def _sanitize_template_placeholders(text: str) -> str:
+        import re as _re
+
+        # The raw Paperclip/local-dispatch prompt contains example snippets like
+        # `{issueId}` and `{companyId}`. Those are documentation placeholders, not
+        # missing webhook fields, but the receiving gateway's malformed-payload
+        # detector scans the fully rendered prompt and will treat them as routing
+        # failures unless we neutralize them before forwarding.
+        return _re.sub(r"\{([a-zA-Z0-9_.]+)\}", r"<\1>", text)
+
+    def _extract_forward_metadata(raw_query: str) -> dict:
+        import re as _re
+
+        meta = {
+            "action": "task-assign",
+            "issueId": "",
+            "id": "",
+            "identifier": "",
+            "title": "Local dispatch",
+            "priority": "medium",
+            "from": "paperclip-local",
+            "fromPort": "3100",
+            "parentIssueId": "",
+            "parentId": "",
+            "companyId": os.getenv("PAPERCLIP_COMPANY_ID", "").strip(),
+        }
+
+        sender_match = _re.search(r"^INCOMING TASK from\s+(.+?):\s*$", raw_query, _re.MULTILINE)
+        if sender_match:
+            sender = sender_match.group(1).strip()
+            if sender:
+                meta["from"] = sender
+
+        issue_line_match = _re.search(r"^Issue:[ \t]*([^\n\r]*)$", raw_query, _re.MULTILINE)
+        if issue_line_match:
+            issue_line = issue_line_match.group(1).strip()
+            if issue_line.startswith("—"):
+                title = issue_line.lstrip("—").strip()
+                if title:
+                    meta["title"] = title
+            elif " — " in issue_line:
+                ident, title = issue_line.split(" — ", 1)
+                if ident.strip():
+                    meta["identifier"] = ident.strip()
+                if title.strip():
+                    meta["title"] = title.strip()
+            elif issue_line:
+                meta["title"] = issue_line
+
+        for key, pattern in {
+            "priority": r"^Priority:[ \t]*([^\n\r]*)$",
+            "issueId": r"^Issue ID:[ \t]*([^\n\r]*)$",
+            "parentIssueId": r"^Parent:[ \t]*([^\n\r]*)$",
+            "companyId": r"^Company ID:[ \t]*([^\n\r]*)$",
+        }.items():
+            match = _re.search(pattern, raw_query, _re.MULTILINE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    meta[key] = value
+
+        meta["id"] = meta["issueId"]
+        meta["parentId"] = meta["parentIssueId"]
+        return meta
+
+    payload = {
+        **_extract_forward_metadata(query),
+        "context": _sanitize_template_placeholders(query),
+    }
+    body = _json.dumps(payload).encode("utf-8")
+
+    # --- 4. HMAC-SHA256 signature ------------------------------------------
+    sig = _hmac.new(webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+
+    # --- 5. POST to the running gateway's task-inbox -----------------------
+    url = f"http://127.0.0.1:{webhook_port}/webhooks/task-inbox"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Webhook-Signature": sig,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = resp.read().decode("utf-8", errors="replace")
+            print(f"[gateway-forward] Task dispatched to gateway :{webhook_port}")
+            if result:
+                try:
+                    data = _json.loads(result)
+                    if data.get("status"):
+                        print(f"[gateway-forward] Response: {data['status']}")
+                except _json.JSONDecodeError:
+                    pass
+            return True
+    except urllib.error.URLError as e:
+        # Gateway port is up per PID but webhook endpoint unreachable —
+        # fall through to one-shot so the task doesn't get lost.
+        print(f"[gateway-forward] Gateway unreachable ({e}), falling back to one-shot")
+        return False
+    except Exception as e:
+        print(f"[gateway-forward] Forward failed ({e}), falling back to one-shot")
+        return False
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # ── Gateway forward shim ──────────────────────────────────────────────
+    # If running in quiet/query mode (-q) and a persistent gateway is alive
+    # for this HERMES_HOME, forward the task there instead of starting a
+    # throwaway one-shot session.  This lets Paperclip's hermes_local adapter
+    # work exactly as before while routing to persistent gateways.
+    query = getattr(args, "query", None)
+    if query and getattr(args, "quiet", False):
+        if _try_gateway_forward(query):
+            return  # Task dispatched — nothing else to do
+
     # Resolve --continue into --resume with the latest CLI session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):

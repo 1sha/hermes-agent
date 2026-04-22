@@ -618,8 +618,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # Start the bot in background
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+            # Wait for ready — 120s to handle Discord rate-limiting after rapid reconnects
+            await asyncio.wait_for(self._ready_event.wait(), timeout=120)
             
             self._running = True
             return True
@@ -1936,12 +1936,15 @@ class DiscordAdapter(BasePlatformAdapter):
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
-        # in a thread where the bot has already participated.
+        # in a thread where the bot has already participated and follow-up
+        # replies are explicitly allowed.
         #
         # Config (all settable via discord.* in config.yaml):
         #   discord.require_mention: Require @mention in server channels (default: true)
         #   discord.free_response_channels: Channel IDs where bot responds without mention
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.allow_participated_threads: Allow mention-free follow-ups in
+        #       threads the bot has already joined (default: true)
 
         thread_id = None
         parent_channel_id = None
@@ -1958,11 +1961,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_ids.add(parent_channel_id)
 
             require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            allow_participated_threads = os.getenv("DISCORD_ALLOW_PARTICIPATED_THREADS", "true").lower() in ("true", "1", "yes")
             is_free_channel = bool(channel_ids & free_channels)
 
             # Skip the mention check if the message is in a thread where
-            # the bot has previously participated (auto-created or replied in).
-            in_bot_thread = is_thread and thread_id in self._bot_participated_threads
+            # the bot has previously participated (auto-created or replied in)
+            # AND the profile explicitly allows mention-free thread follow-ups.
+            in_bot_thread = (
+                is_thread
+                and allow_participated_threads
+                and thread_id in self._bot_participated_threads
+            )
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if self._client.user not in message.mentions:
@@ -2142,6 +2151,21 @@ class DiscordAdapter(BasePlatformAdapter):
         if not event_text or not event_text.strip():
             event_text = "(The user sent a message with no text content)"
 
+        # Resolve reply context: fetch the text of the message being replied to
+        # so the agent sees [Replying to: "..."] context (like Feishu/Telegram).
+        _reply_to_id = str(message.reference.message_id) if message.reference else None
+        _reply_to_text = None
+        if message.reference:
+            try:
+                # discord.py caches resolved_message when available
+                ref_msg = message.reference.resolved
+                if ref_msg is None:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                if ref_msg and ref_msg.content:
+                    _reply_to_text = ref_msg.content
+            except Exception as e:
+                logger.debug("[Discord] Could not fetch replied-to message: %s", e)
+
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -2150,7 +2174,8 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=str(message.id),
             media_urls=media_urls,
             media_types=media_types,
-            reply_to_message_id=str(message.reference.message_id) if message.reference else None,
+            reply_to_message_id=_reply_to_id,
+            reply_to_text=_reply_to_text,
             timestamp=message.created_at,
         )
 
